@@ -19,7 +19,7 @@ const App: React.FC = () => {
   const [setupStep, setSetupStep] = useState<'PERMISSION' | 'SILENCE' | 'VOICE' | 'COMPLETE'>('PERMISSION');
   const [currentMidiNote, setCurrentMidiNote] = useState<number | null>(null);
   const [isRecording, setIsRecording] = useState(false);
-  const [isLiveMonitorEnabled, setIsLiveMonitorEnabled] = useState(false); // NUOVO STATO
+  const [isLiveMonitorEnabled, setIsLiveMonitorEnabled] = useState(false); 
   const [isPlayingBack, setIsPlayingBack] = useState<string | null>(null);
   const [sessions, setSessions] = useState<StudioSession[]>([]);
   const [rmsVolume, setRmsVolume] = useState(0);
@@ -70,39 +70,17 @@ const App: React.FC = () => {
       oscillator: { type: 'triangle' },
       envelope: { attack: 0.01, decay: 0.1, sustain: 0.5, release: 0.5 }
     };
-    // ... (manteniamo i tuoi switch case per i settaggi degli strumenti)
+
+    switch (instrument.category) {
+      case 'PIANO': settings = { oscillator: { type: 'triangle8' }, envelope: { attack: 0.005, decay: 0.2, sustain: 0.3, release: 1.2 } }; break;
+      case 'STRINGS': settings = { oscillator: { type: 'sawtooth' }, envelope: { attack: 0.4, decay: 0.4, sustain: 0.8, release: 1.5 } }; break;
+      case 'SYNTH': settings = { oscillator: { type: 'fatsawtooth', count: 3, spread: 30 }, envelope: { attack: 0.05, decay: 0.3, sustain: 0.4, release: 0.8 } }; break;
+      case 'BASS': settings = { oscillator: { type: 'square' }, envelope: { attack: 0.01, decay: 0.1, sustain: 0.6, release: 0.2 } }; break;
+      default: settings = { oscillator: { type: 'triangle' }, envelope: { attack: 0.01, decay: 0.1, sustain: 0.5, release: 0.5 } };
+    }
     synthRef.current.set(settings);
   }, []);
 
-  const initAudioCore = async () => {
-    await Tone.start();
-    if (Tone.context.state !== 'running') await Tone.context.resume();
-    if (synthRef.current) return true;
-
-    const synth = new Tone.PolySynth(Tone.Synth).toDestination();
-    const mic = new Tone.UserMedia();
-    const analyser = new Tone.Analyser('waveform', 1024);
-    const recorder = new Tone.Recorder();
-    
-    try {
-      await mic.open();
-      mic.connect(analyser);
-      mic.connect(recorder);
-      
-      synthRef.current = synth;
-      micRef.current = mic;
-      analyserRef.current = analyser;
-      recorderRef.current = recorder;
-      
-      applyInstrumentSettings(selectedInstrument);
-      return true;
-    } catch (err) {
-      console.error("Audio init error:", err);
-      return false;
-    }
-  };
-
-  // FUNZIONE NUOVA PER IL MONITOR LIVE
   const toggleLiveMonitor = useCallback(() => {
     if (!micRef.current) return;
     if (!isLiveMonitorEnabled) {
@@ -110,76 +88,182 @@ const App: React.FC = () => {
       setIsLiveMonitorEnabled(true);
     } else {
       micRef.current.disconnect(Tone.getDestination());
-      // Riconnetti gli indispensabili
       if (analyserRef.current) micRef.current.connect(analyserRef.current);
       if (recorderRef.current) micRef.current.connect(recorderRef.current);
       setIsLiveMonitorEnabled(false);
     }
   }, [isLiveMonitorEnabled]);
 
-  // ... (Tutte le altre tue funzioni startSetupWizard, audioLoop, etc. rimangono invariate)
+  const toggleRecording = async () => {
+    if (!isRecording) {
+      recordingNotesRef.current = [];
+      recordingStartTimeRef.current = Tone.now();
+      recorderRef.current?.start();
+      setIsRecording(true);
+      setMode(WorkstationMode.RECORD);
+    } else {
+      const audioBlob = await recorderRef.current?.stop();
+      if (!audioBlob) return;
+      const url = URL.createObjectURL(audioBlob);
+      
+      if (activeNoteStartRef.current) {
+        const duration = Math.max(0, Tone.now() - recordingStartTimeRef.current - activeNoteStartRef.current.start);
+        if (duration >= MIN_NOTE_DURATION) {
+          recordingNotesRef.current.push({ ...activeNoteStartRef.current, duration, time: activeNoteStartRef.current.start });
+        }
+        activeNoteStartRef.current = null;
+      }
+
+      const newSession: StudioSession = {
+        id: Math.random().toString(36).substr(2, 9),
+        timestamp: Date.now(),
+        midiNotes: [...recordingNotesRef.current],
+        audioUrl: url,
+        instrumentName: selectedInstrument.name
+      };
+      setSessions(prev => [newSession, ...prev]);
+      setIsRecording(false);
+      setMode(WorkstationMode.IDLE);
+      setShowHistory(true);
+    }
+  };
+
+  const stopAllAudio = () => {
+    synthRef.current?.releaseAll();
+    if (playerRef.current) {
+      playerRef.current.stop();
+      playerRef.current.dispose();
+      playerRef.current = null;
+    }
+    if (isRecording) toggleRecording();
+    if (isLiveMonitorEnabled) toggleLiveMonitor();
+    setMode(WorkstationMode.IDLE);
+    setIsPlayingBack(null);
+    setCurrentMidiNote(null);
+  };
+
+  const audioLoop = () => {
+    if (!analyserRef.current || !synthRef.current) return;
+    if (stateRef.current.isPlayingBack) { requestAnimationFrame(audioLoop); return; }
+
+    const buffer = analyserRef.current.getValue() as Float32Array;
+    let sum = 0;
+    for (let i = 0; i < buffer.length; i++) {
+      const boostedSample = buffer[i] * stateRef.current.micBoost;
+      sum += boostedSample * boostedSample;
+    }
+    const rms = Math.sqrt(sum / buffer.length);
+    setRmsVolume(prev => prev * 0.7 + rms * 0.3);
+
+    if (stateRef.current.isConfiguring && setupStep !== 'VOICE') { requestAnimationFrame(audioLoop); return; }
+
+    const shouldHearSynth = stateRef.current.mode === WorkstationMode.LIVE && !stateRef.current.isRecording;
+
+    if (rms > stateRef.current.sensitivity) {
+      const freq = detectPitch(buffer, Tone.getContext().sampleRate);
+      const midi = freq ? frequencyToMidi(freq) : null;
+
+      if (midi !== null && midi !== stateRef.current.lastMidi) {
+        const noteName = midiToNoteName(midi);
+        if (stateRef.current.lastMidi !== null) {
+          synthRef.current.triggerRelease(midiToNoteName(stateRef.current.lastMidi));
+          if (stateRef.current.isRecording && activeNoteStartRef.current) {
+            const duration = Tone.now() - recordingStartTimeRef.current - activeNoteStartRef.current.start;
+            if (duration >= MIN_NOTE_DURATION) recordingNotesRef.current.push({ ...activeNoteStartRef.current, duration, time: activeNoteStartRef.current.start });
+            activeNoteStartRef.current = null;
+          }
+        }
+        if (shouldHearSynth) synthRef.current.triggerAttack(noteName);
+        setCurrentMidiNote(midi);
+        if (stateRef.current.isRecording) activeNoteStartRef.current = { note: noteName, start: Tone.now() - recordingStartTimeRef.current };
+      }
+    } else if (stateRef.current.lastMidi !== null) {
+      synthRef.current.triggerRelease(midiToNoteName(stateRef.current.lastMidi));
+      setCurrentMidiNote(null);
+    }
+    requestAnimationFrame(audioLoop);
+  };
+
+  const initAudioCore = async () => {
+    await Tone.start();
+    if (synthRef.current) return true;
+    try {
+      const mic = new Tone.UserMedia();
+      await mic.open();
+      micRef.current = mic;
+      synthRef.current = new Tone.PolySynth(Tone.Synth).toDestination();
+      analyserRef.current = new Tone.Analyser('waveform', 1024);
+      recorderRef.current = new Tone.Recorder();
+      mic.connect(analyserRef.current);
+      mic.connect(recorderRef.current);
+      applyInstrumentSettings(selectedInstrument);
+      return true;
+    } catch { return false; }
+  };
+
+  const startSetupWizard = async () => {
+    setIsConfiguring(true); setSetupStep('PERMISSION');
+    if (await initAudioCore()) {
+      requestAnimationFrame(audioLoop);
+      setSetupStep('SILENCE');
+      setTimeout(() => { setSetupStep('VOICE'); }, 2000);
+      setTimeout(() => { setSetupStep('COMPLETE'); }, 5000);
+    }
+  };
 
   return (
-    <div className="min-h-screen bg-black text-white flex flex-col items-center p-4 pb-32 max-w-lg mx-auto overflow-x-hidden">
-      {/* HEADER */}
+    <div className="min-h-screen bg-black text-white flex flex-col items-center p-4 pb-32 max-w-lg mx-auto">
       <header className="w-full flex justify-between items-center py-6">
-         {/* ... (tuo header invariato) */}
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 bg-purple-600 rounded-xl flex items-center justify-center"><Music /></div>
+          <h1 className="text-lg font-black uppercase">VocalSynth<span className="text-purple-500">Pro</span></h1>
+        </div>
+        {isStarted && <button onClick={() => setShowSettings(!showSettings)} className="p-2 bg-zinc-900 rounded-full"><Settings /></button>}
       </header>
 
-      {/* SETUP WIZARD (tuo wizard invariato) */}
-      {isConfiguring && (
-         <div className="fixed inset-0 z-[200] bg-black/95 backdrop-blur-xl flex flex-col items-center justify-center p-8">
-            {/* ... */}
-         </div>
+      {!isStarted && !isConfiguring && (
+        <button onClick={startSetupWizard} className="mt-20 px-10 py-5 bg-purple-600 rounded-full font-bold">START STUDIO</button>
       )}
 
-      {!showHistory && isStarted && !isConfiguring && (
-        <div className="w-full animate-in fade-in duration-500 flex flex-col h-[calc(100vh-180px)]">
-          {/* SETTINGS (tuo settings invariato) */}
+      {isConfiguring && (
+        <div className="text-center mt-20">
+          <h2 className="text-2xl font-bold">{setupStep}</h2>
+          {setupStep === 'COMPLETE' && <button onClick={() => {setIsStarted(true); setIsConfiguring(false);}} className="mt-10 px-10 py-5 bg-white text-black rounded-full font-bold">ENTER</button>}
+        </div>
+      )}
+
+      {isStarted && (
+        <div className="w-full flex flex-col">
+          <div className="w-full h-44 bg-zinc-900 rounded-[2.5rem] mb-6 flex items-center justify-center relative overflow-hidden">
+             <Mic size={48} className={rmsVolume > sensitivity ? 'text-purple-500 scale-110' : 'text-zinc-700'} />
+          </div>
+
+          <div className="grid grid-cols-3 gap-2 mb-8">
+            <button onClick={() => setMode(mode === WorkstationMode.LIVE ? WorkstationMode.IDLE : WorkstationMode.LIVE)}
+              className={`py-5 rounded-3xl text-[10px] font-bold border-2 ${mode === WorkstationMode.LIVE ? 'bg-purple-600 border-purple-600' : 'bg-zinc-900 border-transparent'}`}>
+              <Activity className="mx-auto mb-1" /> LIVE PLAY
+            </button>
+
+            <button onClick={toggleLiveMonitor}
+              className={`py-5 rounded-3xl text-[10px] font-bold border-2 ${isLiveMonitorEnabled ? 'bg-blue-600 border-blue-600' : 'bg-zinc-900 border-transparent'}`}>
+              <Headphones className="mx-auto mb-1" /> LIVE VOICE
+            </button>
+
+            <button onClick={toggleRecording}
+              className={`py-5 rounded-3xl text-[10px] font-bold border-2 ${isRecording ? 'bg-red-600 border-red-600' : 'bg-zinc-900 border-transparent'}`}>
+              <Disc className="mx-auto mb-1" /> {isRecording ? 'STOP' : 'RECORD'}
+            </button>
+          </div>
           
-          {/* VISUALIZER BOX */}
-          <div className="w-full h-44 bg-[#050505] rounded-[2.5rem] border border-white/5 relative overflow-hidden mb-6 flex items-center justify-center shadow-2xl group shrink-0">
-             {/* ... (tuo visualizer invariato) */}
+          <div className="text-[10px] text-zinc-500 uppercase font-bold mb-4">Instruments</div>
+          <div className="grid grid-cols-2 gap-2">
+            {INSTRUMENTS.slice(0, 4).map(inst => (
+              <button key={inst.id} onClick={() => setSelectedInstrument(inst)} 
+                className={`p-4 rounded-2xl border-2 ${selectedInstrument.id === inst.id ? 'border-purple-600 bg-zinc-900' : 'border-zinc-900'}`}>
+                {inst.name}
+              </button>
+            ))}
           </div>
-
-          {/* PULSANTI DI CONTROLLO - MODIFICATI PER 3 COLONNE */}
-          <div className="w-full grid grid-cols-3 gap-2 mb-8 shrink-0">
-            {/* 1. LIVE PLAY (Sintetizzatore) */}
-            <button 
-              onClick={() => { 
-                const isCurrentlyLive = mode === WorkstationMode.LIVE && !isRecording;
-                if (isCurrentlyLive) {
-                  setMode(WorkstationMode.IDLE);
-                  synthRef.current?.releaseAll();
-                } else {
-                  setMode(WorkstationMode.LIVE);
-                  if (isRecording) toggleRecording();
-                }
-              }}
-              className={`py-5 rounded-3xl font-black text-[10px] transition-all border-2 flex flex-col items-center justify-center gap-1 ${mode === WorkstationMode.LIVE && !isRecording ? 'bg-purple-600 text-white border-purple-600 shadow-lg shadow-purple-500/20' : 'bg-zinc-900 text-zinc-500 border-transparent hover:bg-zinc-800 active:scale-95'}`}
-            >
-              <Activity size={16} /> LIVE PLAY
-            </button>
-
-            {/* 2. LIVE MONITOR (NUOVO - La tua voce live) */}
-            <button 
-              onClick={toggleLiveMonitor}
-              className={`py-5 rounded-3xl font-black text-[10px] transition-all border-2 flex flex-col items-center justify-center gap-1 ${isLiveMonitorEnabled ? 'bg-blue-600 text-white border-blue-600 shadow-lg shadow-blue-500/20' : 'bg-zinc-900 text-zinc-500 border-transparent hover:bg-zinc-800 active:scale-95'}`}
-            >
-              <Headphones size={16} /> {isLiveMonitorEnabled ? 'VOICE ON' : 'LIVE VOICE'}
-            </button>
-
-            {/* 3. RECORD */}
-            <button 
-              onClick={() => { toggleRecording(); }}
-              className={`py-5 rounded-3xl font-black text-[10px] transition-all border-2 flex flex-col items-center justify-center gap-1 ${isRecording ? 'bg-red-600 text-white border-red-600 shadow-xl shadow-red-500/30' : 'bg-zinc-900 text-zinc-500 border-transparent hover:bg-zinc-800 active:scale-95'}`}
-            >
-              {isRecording ? <Square size={16} fill="white" /> : <Disc size={16} />}
-              {isRecording ? 'STOP REC' : 'RECORD'}
-            </button>
-          </div>
-
-          {/* ... (Resto del codice: Sound Browser, Archive, etc. invariato) */}
         </div>
       )}
     </div>
