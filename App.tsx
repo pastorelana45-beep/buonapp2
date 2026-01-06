@@ -4,7 +4,7 @@ import * as Tone from 'tone';
 import { 
   Music, Settings, Mic, Play, Square, Volume2, Trash2, 
   Activity, Sliders, Wand2, Disc, Headphones, 
-  Download, XCircle, History, AudioWaveform, Zap, Clock, ChevronRight, CheckCircle2, ShieldCheck, Layers, SwapHorizontal
+  Download, XCircle, History, AudioWaveform, Zap, Clock, ChevronRight, CheckCircle2, ShieldCheck, Layers
 } from 'lucide-react';
 import { INSTRUMENTS, CATEGORIES } from './constants';
 import { Instrument, Category, WorkstationMode, RecordedNote, StudioSession } from './types';
@@ -508,7 +508,7 @@ const App: React.FC = () => {
             {setupStep === 'COMPLETE' && (
               <button 
                 onClick={finishSetup}
-                className="w-full bg-white text-black py-6 rounded-full font-black text-lg hover:scale-105 active:scale-95 transition-all uppercase tracking-tighter shadow-2xl"
+                className="w-full max-w-xs bg-white text-black py-6 rounded-full font-black text-lg hover:scale-105 active:scale-95 transition-all uppercase tracking-tighter shadow-2xl"
               >
                 Entra in Studio
               </button>
